@@ -1,5 +1,6 @@
 package com.example.fluxloops
 
+import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -7,21 +8,19 @@ import android.content.IntentFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
-import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.Shader
-import android.graphics.SweepGradient
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.os.SystemClock
+import android.os.PowerManager
 import android.service.wallpaper.WallpaperService
 import android.util.Log
 import android.view.Choreographer
+import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.SurfaceHolder
+import android.view.animation.Interpolator
+import android.view.animation.PathInterpolator
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
@@ -29,203 +28,198 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
-import kotlin.math.sqrt
+
+// Zustandsvektor eines Rings: Position, Tiefe, Größe, Kippwinkel, Deckkraft, 8 Formwerte
+private const val X = 0
+private const val Y = 1
+private const val H = 2
+private const val S = 3
+private const val RX = 4
+private const val RY = 5
+private const val A = 6
+private const val SH = 7
+private const val N = 15
+
+private const val PER = 40            // Stützpunkte pro Viertelbogen (viele = runde Kurve ohne Knicke)
+private const val TOTAL = 4 * PER
+private const val SEC = 1_000_000_000L
+private const val KAPPA = 0.55228f
 
 class LoopsWallpaperService : WallpaperService() {
 
     override fun onCreateEngine(): Engine = LoopsEngine()
 
-    /**
-     * Ein dünner Loop: fast kreisförmige Ellipse, oben links hell, unten rechts dunkel.
-     * cx, cy: Ruhelage des Mittelpunkts (Anteil von Breite/Höhe)
-     * r: Radius als Anteil der Breite, asp: Verhältnis Höhe/Breite der Ellipse
-     * phiDeg: Richtung der hellen Seite (Winkel, y zeigt nach unten)
-     * depth: Folgefaktor beim Wischen, fa/fb: Reibung beim Ausgleiten
-     * introX/introY: Startversatz beim Entsperren (Anteil von Breite/Höhe), introT: Dauer in s
-     * blurBase: Grundunschärfe des ganzen Loops (0 = scharf, 1 = sehr unscharf)
-     * blurAmt/blurPos: zusätzliche Unschärfe an einer Stelle des Bogens (Position 0..1)
-     */
-    private class Loop(
-        val cx: Float, val cy: Float, val r: Float, val asp: Float,
-        val rotDeg: Float, val phiDeg: Float, val widthDp: Float,
-        val hiColor: Int, val shColor: Int,
-        val depth: Float, val fa: Float, val fb: Float,
-        val introX: Float, val introY: Float, val introT: Float,
-        val blurBase: Float, val blurAmt: Float, val blurPos: Float
+    /** Ein Ring (Loop) im 3D-Raum. Bis zu 6 gleichzeitig, neue Ringe verdrängen die ältesten. */
+    private class Ring(
+        val uWidth: Float,   // Breite des Bandes (Anteil)
+        val jScale: Float,   // Startgröße, begrenzt die Breite bei größeren Ringen
+        val colorA: Int,
+        val colorB: Int
     ) {
-        var x = 0f   // Verschiebung durch Wischen (Pixel)
-        var y = 0f
-        var vx = 0f  // Geschwindigkeit in Pixel/s
-        var vy = 0f
-        var hiShader: Shader? = null
-        var shShader: Shader? = null
+        val cur = FloatArray(N)
+        val from = FloatArray(N)
+        val to = FloatArray(N)
+        var depth = 0f       // 0 = vorne (scharf), größer = näher an der Kamera (unschärfer)
+        var startNs = 0L
+        var delayNs = 0L
+        var durNs = 1L
+        var interp = 0
+        var fading = false
+
+        fun active(now: Long): Boolean = now < startNs + delayNs + durNs
     }
 
     inner class LoopsEngine : Engine(), Choreographer.FrameCallback {
 
         private val tag = "LoopsWP"
 
-        // Hier einstellen: Liniendicke und Stärke des Scheins
-        private val thicknessScale = 1.5f
-        private val glowStrength = 1.0f
+        // ---- Einstellungen zum Anpassen ------------------------------------------
+        private val lineWidthScale = 1.4f   // Liniendicke insgesamt
+        private val glowStrength = 1.0f     // Stärke des Scheins an hellen Stellen (0 = aus)
 
-        // Rottöne wie bisher (hier ändern, wenn es anders aussehen soll)
+        // Rottöne wie bisher
         private val light = Color.parseColor("#D6A2A7")
         private val mid = Color.parseColor("#CD7588")
         private val dark = Color.parseColor("#B55D63")
+        private val palette = intArrayOf(light, mid, dark)
 
-        private val loops = listOf(
-            Loop(1.02f, 0.44f, 0.60f, 1.05f, -8f, -130f, 2.6f, light, dark, 0.35f, 1.5f, 5f, 0.75f, 0.18f, 2.6f, 0.00f, 0.70f, 0.75f),
-            Loop(1.05f, 0.43f, 0.64f, 1.00f, 5f, -140f, 2.0f, mid, dark, 0.30f, 1.8f, 5f, 0.65f, 0.12f, 2.3f, 0.15f, 0.60f, 0.30f),
-            Loop(0.98f, 0.46f, 0.57f, 1.10f, -12f, -120f, 1.8f, light, mid, 0.24f, 2.2f, 5f, 0.50f, -0.05f, 1.8f, 0.00f, 0.80f, 0.80f),
-            Loop(1.10f, 0.40f, 0.70f, 1.00f, 0f, -150f, 1.5f, light, dark, 0.18f, 2.6f, 5f, 0.35f, 0.10f, 1.2f, 0.35f, 0.50f, 0.50f),
-            Loop(1.00f, 0.42f, 0.52f, 1.15f, 10f, -125f, 1.4f, mid, dark, 0.12f, 3.2f, 5f, 0.22f, -0.08f, 0.8f, 0.10f, 0.70f, 0.25f),
-            Loop(1.08f, 0.47f, 0.66f, 1.05f, -4f, -135f, 1.1f, light, mid, 0.08f, 4.0f, 5f, 0.14f, 0.04f, 0.5f, 0.50f, 0.40f, 0.60f),
-            Loop(0.95f, 0.45f, 0.46f, 1.20f, 15f, -115f, 1.6f, mid, dark, 0.05f, 5.0f, 5f, 0.08f, -0.03f, 0.35f, 0.20f, 0.70f, 0.70f)
-        )
+        // ---- Zustand --------------------------------------------------------------
+        private val rnd = java.util.Random()
+        private val rings = arrayOfNulls<Ring>(6)
+        private var nextSlot = 0
 
-        private val steps = 48
-        private val outX = FloatArray(steps + 1)
-        private val outY = FloatArray(steps + 1)
-        private val inX = FloatArray(steps + 1)
-        private val inY = FloatArray(steps + 1)
-        private val piF = Math.PI.toFloat()
-
-        // Schichten pro Bogen: zwei Glow-Schichten hinten, dann der scharfe Kern
-        private val layerGrow = floatArrayOf(2.2f, 1.1f, 0f)
-        private val layerAlphaScale = floatArrayOf(0.08f, 0.15f, 1f)
-
-        private val density = resources.displayMetrics.density
-        private val bgPaint = Paint()
-        private val loopPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        private val path = Path()
-        private val shaderMatrix = Matrix()
-        private val handler = Handler(Looper.getMainLooper())
-
-        private var w = 1
-        private var h = 1
+        private var screenW = 1
+        private var screenH = 1
         private var visible = false
         private var scheduled = false
-        private var lastFrameNanos = 0L
+        private var launched = false
+        private var pending = 0           // 1 = Bildschirm an (gesperrt), 2 = entsperrt
+        private var camC0 = 0f            // Seitenposition des Startbildschirms minus 0,5
+        private var pane = 0f             // Seite -1..1, Zielposition der Ringe hängt davon ab
+        private var gotSwitchPage = false
+        private var widthBase = 0.05f
+        private var lastCmdMs = 0L
 
-        // Eingaben, die im nächsten Frame verarbeitet werden
-        private var inDx = 0f
-        private var inDy = 0f
-        private var lastTouchX = 0f
-        private var lastTouchY = 0f
-        private var lastTouchMs = 0L
+        private val interps: Array<Interpolator> = arrayOf(
+            PathInterpolator(0.0f, 0.0f, 0.2f, 1.0f),
+            PathInterpolator(0.075f, 0.0f, 0.2f, 1.0f),
+            PathInterpolator(0.2f, 0.0f, 0.3f, 1.0f),
+            PathInterpolator(0.7f, 0.0f, 0.3f, 1.0f)
+        )
+        private val touchRise: Interpolator = PathInterpolator(0.2f, 0.0f, 0.3f, 1.0f)
+        private val touchFall: Interpolator = PathInterpolator(0.0f, 0.0f, 0.2f, 1.0f)
 
-        // Position des Startbildschirms (für Launcher, die Offsets melden)
-        private var prevXOff = 0f
-        private var prevYOff = 0f
-        private var haveOffset = false
+        // Berührung: Linien werden zum Finger gezogen
+        private var tpDown = false
+        private var tpDownMs = 0L
+        private var tpX0 = 0f
+        private var tpY0 = 0f
+        private var tpX = 0f
+        private var tpY = 0f
+        private var tpRelStr = 0f
+        private var tpRelMs = 0L
 
-        // Entsperr-Animation
-        private var animStartMs = 0L
-        private var pendingPush = false
-        private var lastPushMs = 0L
+        // Zeichenpuffer
+        private val cp = FloatArray(24)
+        private val sxA = FloatArray(TOTAL)
+        private val syA = FloatArray(TOTAL)
+        private val ndxA = FloatArray(TOTAL)
+        private val ndyA = FloatArray(TOTAL)
+        private val zcA = FloatArray(TOTAL)
+        private val sclA = FloatArray(TOTAL)
+        private val ptA = FloatArray(TOTAL)
 
-        private val unlockReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                requestPush("Broadcast " + intent.action)
-            }
+        private val bgPaint = Paint()
+        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.BUTT
         }
 
-        init {
-            // Farbverläufe mit Schärfeverlauf entlang des Bogens einmalig vorbereiten
-            for (l in loops) {
-                val phi = Math.toRadians(l.phiDeg.toDouble()).toFloat()
-                l.hiShader = makeSweep(l, phi, l.hiColor, l.blurPos)
-                l.shShader = makeSweep(l, phi + piF, l.shColor, 1f - l.blurPos)
-            }
-        }
-
-        // Unschärfe (0..1) an der Stelle s (0..1) des Bogens
-        private fun blurAt(l: Loop, s: Float, pos: Float): Float {
-            val d = abs(s - pos) / 0.3f
-            val bump = if (d >= 1f) 0f else (1f - d * d) * (1f - d * d)
-            return min(1f, l.blurBase + l.blurAmt * bump)
-        }
-
-        // Farbverlauf um den Mittelpunkt: unscharfe Stellen werden blasser
-        private fun makeSweep(l: Loop, midAngle: Float, color: Int, pos: Float): Shader {
-            val n = 72
-            val twoPi = 2f * piF
-            val colors = IntArray(n + 1)
-            for (i in 0..n) {
-                val theta = twoPi * i / n
-                var a = (theta - (midAngle - piF / 2f)) % twoPi
-                if (a < 0f) a += twoPi
-                val alpha = if (a <= piF) {
-                    (255f * (1f - 0.65f * blurAt(l, a / piF, pos))).toInt()
-                } else {
-                    0
+        private val gestures = GestureDetector(
+            this@LoopsWallpaperService,
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onFling(
+                    e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float
+                ): Boolean {
+                    if (e1 == null) return false
+                    val dx = velocityX / 32f + (e2.x - e1.x)
+                    val dy = velocityY / 32f + (e2.y - e1.y)
+                    fling(dx * 0.5625f / screenW, dy * 0.75f / screenH)
+                    return true
                 }
-                colors[i] = Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
             }
-            return SweepGradient(0f, 0f, colors, null)
+        )
+
+        private val screenReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val pm = this@LoopsWallpaperService.getSystemService(Context.POWER_SERVICE) as PowerManager
+                val km = this@LoopsWallpaperService.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                Log.d(tag, "Broadcast " + intent.action)
+                when (intent.action) {
+                    Intent.ACTION_SCREEN_OFF -> if (!pm.isInteractive) eventScreenOff()
+                    Intent.ACTION_SCREEN_ON -> post(if (km.isKeyguardLocked) 1 else 2)
+                    Intent.ACTION_USER_PRESENT -> post(2)
+                }
+            }
         }
+
+        // ---- Lebenszyklus ---------------------------------------------------------
 
         override fun onCreate(surfaceHolder: SurfaceHolder) {
             super.onCreate(surfaceHolder)
             setTouchEventsEnabled(true)
             val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(Intent.ACTION_USER_PRESENT)
             }
             if (Build.VERSION.SDK_INT >= 33) {
                 this@LoopsWallpaperService.registerReceiver(
-                    unlockReceiver, filter, Context.RECEIVER_NOT_EXPORTED
+                    screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED
                 )
             } else {
-                this@LoopsWallpaperService.registerReceiver(unlockReceiver, filter)
+                this@LoopsWallpaperService.registerReceiver(screenReceiver, filter)
             }
-            Log.d(tag, "Engine erstellt, Receiver registriert")
         }
 
         override fun onDestroy() {
             super.onDestroy()
-            handler.removeCallbacksAndMessages(null)
             Choreographer.getInstance().removeFrameCallback(this)
             try {
-                this@LoopsWallpaperService.unregisterReceiver(unlockReceiver)
+                this@LoopsWallpaperService.unregisterReceiver(screenReceiver)
             } catch (e: IllegalArgumentException) {
                 // war nicht registriert
             }
         }
 
-        override fun onCommand(
-            action: String?, x: Int, y: Int, z: Int,
-            extras: Bundle?, resultRequested: Boolean
-        ): Bundle? {
-            if (action == "android.wallpaper.wakingup") {
-                requestPush("Command wakingup")
-            }
-            return super.onCommand(action, x, y, z, extras, resultRequested)
-        }
-
-        override fun onSurfaceChanged(
-            holder: SurfaceHolder, format: Int, width: Int, height: Int
-        ) {
+        override fun onSurfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
             super.onSurfaceChanged(holder, format, width, height)
-            w = max(1, width)
-            h = max(1, height)
+            screenW = max(1, width)
+            screenH = max(1, height)
+            val shortSide = min(screenW, screenH).toFloat()
+            val r = (1080f / shortSide) * (1080f / shortSide) * 0.05f
+            widthBase = max(0.05f, r)
             bgPaint.shader = LinearGradient(
-                0f, 0f, 0f, h.toFloat(),
+                0f, 0f, 0f, screenH.toFloat(),
                 Color.parseColor("#1C0000"), Color.parseColor("#050000"),
                 Shader.TileMode.CLAMP
             )
-            drawFrame()
+            requestFrame()
         }
 
         override fun onVisibilityChanged(visible: Boolean) {
             this.visible = visible
-            Log.d(tag, "Sichtbarkeit: $visible, pendingPush=$pendingPush")
             if (visible) {
-                lastFrameNanos = 0L
-                requestFrame()
-                if (pendingPush) {
-                    handler.postDelayed({ startUnlockAnimation("nach Sichtbarwerden") }, 120)
+                if (!launched) {
+                    launched = true
+                    launch()
                 }
+                if (pending != 0) {
+                    val kind = pending
+                    pending = 0
+                    fire(kind)
+                }
+                requestFrame()
             } else {
                 Choreographer.getInstance().removeFrameCallback(this)
                 scheduled = false
@@ -239,90 +233,289 @@ class LoopsWallpaperService : WallpaperService() {
             scheduled = false
         }
 
-        // Launcher meldet die Seitenposition: die Loops laufen mit (horizontal und vertikal)
+        // Startbildschirm wird verschoben: Kamera fährt seitlich (Parallaxe durch die Tiefe der Ringe)
         override fun onOffsetsChanged(
             xOffset: Float, yOffset: Float,
             xOffsetStep: Float, yOffsetStep: Float,
             xPixelOffset: Int, yPixelOffset: Int
         ) {
-            val dxOff = xOffset - prevXOff
-            val dyOff = yOffset - prevYOff
-            prevXOff = xOffset
-            prevYOff = yOffset
-            if (!haveOffset) {
-                haveOffset = true
-                return
-            }
-            // Wenn gerade echte Touch-Ereignisse ankommen, nicht doppelt zählen
-            if (SystemClock.uptimeMillis() - lastTouchMs < 400) return
-
-            val stepX = if (xOffsetStep > 0f && xOffsetStep < 1f) xOffsetStep else 0.25f
-            val stepY = if (yOffsetStep > 0f && yOffsetStep < 1f) yOffsetStep else 1f
-            val dx = -(dxOff / stepX) * w
-            val dy = -(dyOff / stepY) * h
-            inDx += min(w.toFloat(), max(-w.toFloat(), dx))
-            inDy += min(h.toFloat(), max(-h.toFloat(), dy))
+            camC0 = xOffset - 0.5f
+            if (!gotSwitchPage) pane = camC0 * 2f
             requestFrame()
         }
 
-        // Direkter Fingerzug, falls der Launcher Touch-Ereignisse weitergibt
+        // ---- Befehle vom Launcher und von der Sperrbildschirm-App ----------------
+
+        override fun onCommand(
+            action: String?, x: Int, y: Int, z: Int,
+            extras: Bundle?, resultRequested: Boolean
+        ): Bundle? {
+            val now = System.currentTimeMillis()
+            if (action != null) {
+                Log.d(tag, "Command $action")
+                when (action) {
+                    "com.sonymobile.home.wallpaper.command.SWITCH_PAGE" -> if (extras != null) {
+                        val to = extras.getInt("switch_to_page").toFloat()
+                        val count = max(1, extras.getInt("page_count")).toFloat()
+                        pane = (((to + 1f) / count) - 0.5f) * 2f
+                        gotSwitchPage = true
+                    }
+                    "android.wallpaper.tap" -> if (now - lastCmdMs > 60) {
+                        addCircle(
+                            ((x.toFloat() / screenW) * 2f - 1f) * 1.3f,
+                            -(((y.toFloat() / screenH) * 2f - 1f) * (screenH * 1.3f / screenW))
+                        )
+                        requestFrame()
+                    }
+                    "com.sonymobile.lockscreen.wallpaper.command.FPA_ACQUIRED",
+                    "com.sonymobile.lockscreen.wallpaper.command.FPA_ERROR" -> if (now - lastCmdMs > 60) {
+                        if (extras != null && extras.getInt("reason") == 6) {
+                            fingerprint(0.2f, SEC)      // Finger liegt auf dem Sensor
+                        } else {
+                            fingerprint(0.9f, SEC / 2)  // Fehler
+                        }
+                    }
+                }
+                lastCmdMs = now
+            }
+            return super.onCommand(action, x, y, z, extras, resultRequested)
+        }
+
         override fun onTouchEvent(event: MotionEvent) {
+            gestures.onTouchEvent(event)
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    lastTouchX = event.x
-                    lastTouchY = event.y
-                    lastTouchMs = SystemClock.uptimeMillis()
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    inDx += event.x - lastTouchX
-                    inDy += event.y - lastTouchY
-                    lastTouchX = event.x
-                    lastTouchY = event.y
-                    lastTouchMs = SystemClock.uptimeMillis()
+                    tpDown = true
+                    tpDownMs = System.currentTimeMillis()
+                    tpX0 = event.x
+                    tpY0 = event.y
+                    tpX = event.x
+                    tpY = event.y
                     requestFrame()
                 }
+                MotionEvent.ACTION_MOVE -> {
+                    tpX = event.x
+                    tpY = event.y
+                    requestFrame()
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (tpDown) {
+                        tpRelStr = touchStrength(System.currentTimeMillis())
+                        tpRelMs = System.currentTimeMillis()
+                        tpDown = false
+                        requestFrame()
+                    }
+                }
             }
         }
 
-        // --- Entsperr-Animation -----------------------------------------------------
+        // ---- Ereignisse (Zielwerte entsprechen dem Original) ----------------------
 
-        private fun requestPush(reason: String) {
-            Log.d(tag, "Push angefordert: $reason, sichtbar=$visible")
-            if (visible) {
-                startUnlockAnimation(reason)
-            } else {
-                pendingPush = true // wird beim Sichtbarwerden gestartet
-            }
+        private fun post(kind: Int) {
+            if (visible) fire(kind) else pending = max(pending, kind)
         }
 
-        // Loops starten rechts außerhalb und laufen mit Ease-out an ihre Ruhelage
-        private fun startUnlockAnimation(reason: String) {
-            val now = SystemClock.uptimeMillis()
-            if (now - lastPushMs < 2500) return // doppelte Auslöser zusammenfassen
-            lastPushMs = now
-            pendingPush = false
-            animStartMs = now
-            Log.d(tag, "Entsperr-Animation gestartet: $reason")
+        private fun fire(kind: Int) {
+            if (kind == 1) eventScreenOn() else eventUserPresent()
+        }
+
+        private fun launch() {
+            for (i in 0 until 5) addCircle(0f, 0f)
+        }
+
+        // Bildschirm aus: alle Ringe schrumpfen am rechten Rand auf null
+        private fun eventScreenOff() {
+            pending = 0
+            moveAll8(2.0f + 0.8f * pane, 0.3f, 0f, 0f, 0f, SEC / 10, 0)
+        }
+
+        // Bildschirm an (gesperrt): Ringe wachsen am rechten Rand und laufen leicht nach links
+        private fun eventScreenOn() {
+            moveAll9(
+                2.0f + 0.8f * pane, 0.3f, 1.5f + 0.8f * pane, 0.3f,
+                1.2f, 1.3f, 0.1f, SEC, 0
+            )
             requestFrame()
         }
 
-        // 1 am Anfang, 0 am Ende (Ease-out kubisch)
-        private fun animFactor(l: Loop, nowMs: Long): Float {
-            if (animStartMs == 0L) return 0f
-            val p = (nowMs - animStartMs) / 1000f / l.introT
-            if (p >= 1f) return 0f
-            val q = 1f - max(0f, p)
-            return q * q * q
+        // Entsperrt: Ringe wachsen auf volle Größe und sammeln sich am rechten Rand
+        private fun eventUserPresent() {
+            moveAll8(1.5f + 0.8f * pane, 0.3f, 1.5f, 1.8f, 0.1f, 2 * SEC, 0)
+            requestFrame()
         }
 
-        private fun animActive(nowMs: Long): Boolean {
-            if (animStartMs == 0L) return false
-            val t = (nowMs - animStartMs) / 1000f
-            for (l in loops) if (t < l.introT) return true
-            return false
+        // Finger auf dem Fingerabdrucksensor
+        private fun fingerprint(jitter: Float, durNs: Long) {
+            moveAll8(0.8f * pane + 1.5f, 0.3f, 1.2f, 1.3f, jitter, durNs, 0)
+            requestFrame()
         }
 
-        // --- Animation --------------------------------------------------------------
+        // Wischgeste: Ringe wandern, die vorderen am stärksten (Tiefe bestimmt den Weg)
+        private fun fling(fx: Float, fy: Float) {
+            val now = System.nanoTime()
+            val lo = -2f + camC0 * 2f
+            val hi = 2f + camC0 * 2f
+            for (r in rings) {
+                if (r == null || r.fading) continue
+                evaluate(r, now)
+                System.arraycopy(r.cur, 0, r.from, 0, N)
+                System.arraycopy(r.cur, 0, r.to, 0, N)
+                val k = 1.5f - r.depth
+                r.to[X] = max(lo, min(hi, r.cur[X] + k * fx))
+                r.to[Y] = max(-1.7f, min(1.7f, r.cur[Y] - k * fy))
+                r.to[H] = r.depth
+                val delay = (rnd.nextFloat() * 0.1f * SEC).toLong()
+                begin(r, now, SEC - delay, 1, delay)
+            }
+            requestFrame()
+        }
+
+        // ---- Ringe verwalten ------------------------------------------------------
+
+        private fun rand(a: Float, b: Float): Float = a + rnd.nextFloat() * (b - a)
+
+        private fun jitter(f: Float): Float {
+            val v = rnd.nextFloat() * f - f / 2f
+            return if (v >= f / 6f || v <= -f / 6f) v else 0f
+        }
+
+        private fun evaluate(r: Ring, now: Long) {
+            val t = (now - r.startNs - r.delayNs).toFloat() / r.durNs.toFloat()
+            val e = if (t <= 0f) 0f else if (t >= 1f) 1f else interps[r.interp].getInterpolation(t)
+            for (i in 0 until N) r.cur[i] = r.from[i] + (r.to[i] - r.from[i]) * e
+        }
+
+        private fun begin(r: Ring, now: Long, durNs: Long, interp: Int, delayNs: Long) {
+            r.startNs = now
+            r.durNs = max(1L, durNs)
+            r.delayNs = delayNs
+            r.interp = interp
+        }
+
+        // Ring bewegt sich zu einer neuen Position/Größe, Kippung und Form ändern sich zufällig
+        private fun moveRing(
+            r: Ring, now: Long, x: Float, y: Float, scale: Float,
+            jitterAmount: Float, durNs: Long, interp: Int
+        ) {
+            if (r.fading) return
+            evaluate(r, now)
+            System.arraycopy(r.cur, 0, r.from, 0, N)
+            r.to[X] = x
+            r.to[Y] = y
+            r.to[H] = r.depth
+            r.to[S] = scale
+            r.to[RX] = 0.3927f * (rnd.nextFloat() * 2f - 1f)
+            r.to[RY] = 0.3927f * (rnd.nextFloat() * 2f - 1f)
+            for (k in 0 until 8) r.to[SH + k] = jitter(jitterAmount)
+            begin(r, now, durNs, interp, 0L)
+        }
+
+        private fun moveAll8(
+            x: Float, y: Float, sMin: Float, sMax: Float,
+            jitterAmount: Float, durNs: Long, interp: Int
+        ) {
+            val now = System.nanoTime()
+            for (r in rings) {
+                if (r == null) continue
+                val d = (rand(0.7f, 1f) * durNs).toLong()
+                moveRing(r, now, x, y, rand(sMin, sMax), jitterAmount, d, interp)
+            }
+        }
+
+        // Wie moveAll8, aber Ringe starten zuerst unsichtbar (Größe 0) am Ausgangspunkt
+        private fun moveAll9(
+            fromX: Float, fromY: Float, toX: Float, toY: Float, sMin: Float, sMax: Float,
+            jitterAmount: Float, durNs: Long, interp: Int
+        ) {
+            val now = System.nanoTime()
+            for (r in rings) {
+                if (r == null || r.fading) continue
+                evaluate(r, now)
+                System.arraycopy(r.cur, 0, r.to, 0, N)
+                r.cur[X] = fromX
+                r.cur[Y] = fromY
+                r.cur[H] = r.depth
+                r.cur[S] = 0f
+                System.arraycopy(r.cur, 0, r.from, 0, N)
+                System.arraycopy(r.cur, 0, r.to, 0, N)
+                r.startNs = 0L
+                r.delayNs = 0L
+                r.durNs = 1L
+                val d = (rand(0.7f, 1f) * durNs).toLong()
+                moveRing(r, now, toX, toY, rand(sMin, sMax), jitterAmount, d, interp)
+            }
+        }
+
+        // Neuer Ring (Start oder Tippen): wächst an der Stelle, ältere werden unschärfer
+        private fun addCircle(sx: Float, sy: Float) {
+            val now = System.nanoTime()
+            val x = sx + camC0
+            val scaleTarget = rand(1.5f, 1.6f)
+            val ring = Ring(
+                rand(widthBase, 0.16f), scaleTarget,
+                palette[rnd.nextInt(3)], palette[rnd.nextInt(3)]
+            )
+            ring.cur[X] = x
+            ring.cur[Y] = sy
+            ring.cur[H] = 0f
+            ring.cur[S] = 0.4f * scaleTarget
+            ring.cur[A] = 0f
+            System.arraycopy(ring.cur, 0, ring.from, 0, N)
+            System.arraycopy(ring.cur, 0, ring.to, 0, N)
+            ring.to[S] = scaleTarget
+            ring.to[A] = 0.98f
+            ring.to[RX] = 0.3927f * (rnd.nextFloat() * 2f - 1f)
+            ring.to[RY] = 0.3927f * (rnd.nextFloat() * 2f - 1f)
+            for (k in 0 until 8) ring.to[SH + k] = jitter(0.1f)
+            ring.cur[RX] = 0.3927f * (rnd.nextFloat() * 2f - 1f)
+            ring.cur[RY] = 0.3927f * (rnd.nextFloat() * 2f - 1f)
+            System.arraycopy(ring.cur, 0, ring.from, 0, N)
+            begin(ring, now, SEC, 0, 0L)
+
+            // Ältere Ringe rücken eine Tiefenstufe nach hinten (näher zur Kamera = unschärfer)
+            for (o in rings) {
+                if (o == null) continue
+                o.depth += 0.3f
+                if (!o.fading) {
+                    val tx = o.to[X]
+                    val ty = o.to[Y]
+                    val ts = o.to[S]
+                    moveRing(o, now, tx, ty, ts, 0.3f, SEC, 0)
+                }
+            }
+
+            rings[nextSlot] = ring
+            nextSlot = if (nextSlot == 5) 0 else nextSlot + 1
+
+            // Der nächste Platz ist der älteste Ring: er blendet aus
+            val oldest = rings[nextSlot]
+            if (oldest != null && !oldest.fading) {
+                evaluate(oldest, now)
+                System.arraycopy(oldest.cur, 0, oldest.from, 0, N)
+                System.arraycopy(oldest.cur, 0, oldest.to, 0, N)
+                oldest.to[H] = oldest.depth + 0.3f
+                oldest.to[A] = 0f
+                oldest.fading = true
+                begin(oldest, now, SEC, 0, 0L)
+            }
+        }
+
+        // ---- Berührung ------------------------------------------------------------
+
+        private fun touchStrength(nowMs: Long): Float {
+            if (tpDown) {
+                val dist = hypot((tpX - tpX0) / (screenW / 2f), (tpY - tpY0) / (screenH / 2f))
+                val t = ((nowMs - tpDownMs) - 150f / (dist + 1f)) / 300f
+                return if (t <= 0f) 0f else touchRise.getInterpolation(min(1f, t))
+            }
+            if (tpRelStr > 0f) {
+                val p = touchFall.getInterpolation(min(1f, (nowMs - tpRelMs) / 900f))
+                return max(0f, tpRelStr - p)
+            }
+            return 0f
+        }
+
+        // ---- Animation ------------------------------------------------------------
 
         private fun requestFrame() {
             if (!visible || scheduled) return
@@ -333,77 +526,31 @@ class LoopsWallpaperService : WallpaperService() {
         override fun doFrame(frameTimeNanos: Long) {
             scheduled = false
             if (!visible) return
-            var dt = if (lastFrameNanos == 0L) 1f / 60f
-            else (frameTimeNanos - lastFrameNanos) / 1_000_000_000f
-            dt = min(max(dt, 1f / 240f), 1f / 30f)
-            lastFrameNanos = frameTimeNanos
+            val now = System.nanoTime()
+            drawFrame(now)
 
-            var moving = step(dt)
-            val now = SystemClock.uptimeMillis()
-            if (animActive(now)) {
-                moving = true
-            } else if (animStartMs != 0L) {
-                animStartMs = 0L
-            }
-            drawFrame()
-
-            if (moving) {
-                requestFrame()
-            } else {
-                lastFrameNanos = 0L // Ruhe: keine weiteren Frames, spart Akku
-            }
-        }
-
-        private fun wMaxOf(l: Loop): Float = l.widthDp * density * thicknessScale
-        private fun marginX(l: Loop): Float = l.r * w + wMaxOf(l) * 8f
-        private fun marginY(l: Loop): Float = l.r * w * l.asp + wMaxOf(l) * 8f
-        private fun periodX(l: Loop): Float = w + 2f * marginX(l)
-        private fun periodY(l: Loop): Float = h + 2f * marginY(l)
-
-        // Folgen beim Wischen, danach Ausgleiten mit Reibung (stark bei hohem Tempo, schwach bei niedrigem)
-        private fun step(dt: Float): Boolean {
-            val hasInput = inDx != 0f || inDy != 0f
-            var moving = hasInput
-            for (l in loops) {
-                if (hasInput) {
-                    val mx = inDx * l.depth
-                    val my = inDy * l.depth * 0.6f
-                    l.x += mx
-                    l.y += my
-                    l.vx = 0.5f * l.vx + 0.5f * (mx / dt)
-                    l.vy = 0.5f * l.vy + 0.5f * (my / dt)
-                    moving = true
-                } else {
-                    l.x += l.vx * dt
-                    l.y += l.vy * dt
-                    val speed = hypot(l.vx, l.vy) / w
-                    val f = exp(-(l.fa + l.fb * speed) * dt)
-                    l.vx *= f
-                    l.vy *= f
-                    if (hypot(l.vx, l.vy) > 3f) {
-                        moving = true
-                    } else {
-                        l.vx = 0f
-                        l.vy = 0f
+            var animating = tpDown
+            if (!animating) {
+                for (r in rings) {
+                    if (r != null && r.active(now)) {
+                        animating = true
+                        break
                     }
                 }
-                l.x %= periodX(l)
-                l.y %= periodY(l)
             }
-            inDx = 0f
-            inDy = 0f
-            return moving
+            if (!animating && touchStrength(System.currentTimeMillis()) > 0f) animating = true
+            if (animating) requestFrame()
         }
 
-        // --- Zeichnen ---------------------------------------------------------------
+        // ---- Zeichnen -------------------------------------------------------------
 
-        private fun wrap(v: Float, period: Float, minValue: Float): Float {
-            var r = (v - minValue) % period
-            if (r < 0f) r += period
-            return r + minValue
+        private fun smooth(a: Float, b: Float, x: Float): Float {
+            val t = min(1f, max(0f, (x - a) / (b - a)))
+            return t * t * (3f - 2f * t)
         }
 
-        private fun drawFrame() {
+        private fun drawFrame(now: Long) {
+            if (screenW <= 1) return
             val holder = surfaceHolder
             val canvas = try {
                 holder.lockHardwareCanvas()
@@ -416,96 +563,177 @@ class LoopsWallpaperService : WallpaperService() {
             } ?: return
 
             try {
-                canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), bgPaint)
-                val now = SystemClock.uptimeMillis()
-                for (l in loops) drawLoop(canvas, l, now)
+                canvas.drawRect(0f, 0f, screenW.toFloat(), screenH.toFloat(), bgPaint)
+                val ts = touchStrength(System.currentTimeMillis())
+                for (r in rings) {
+                    if (r == null) continue
+                    evaluate(r, now)
+                    drawRing(canvas, r, ts)
+                }
             } finally {
                 holder.unlockCanvasAndPost(canvas)
             }
         }
 
-        private fun drawLoop(canvas: Canvas, l: Loop, nowMs: Long) {
-            val rx = l.r * w
-            val ry = rx * l.asp
-            val wMax = wMaxOf(l)
-            val f = animFactor(l, nowMs)
-            val offX = l.introX * w * f
-            val offY = l.introY * h * f
-            // Mittelpunkt wandert weiter und kommt auf der Gegenseite wieder herein
-            val cx = wrap(l.cx * w + l.x + offX, periodX(l), -marginX(l))
-            val cy = wrap(l.cy * h + l.y + offY, periodY(l), -marginY(l))
-            val rot = Math.toRadians(l.rotDeg.toDouble()).toFloat()
-            val phi = Math.toRadians(l.phiDeg.toDouble()).toFloat()
-
-            shaderMatrix.setRotate(l.rotDeg)
-            shaderMatrix.postTranslate(cx, cy)
-
-            // dunkle Seite zuerst, helle Seite darüber
-            drawArc(canvas, l, l.shShader, cx, cy, rx, ry, rot, phi + piF, wMax * 0.75f, 1f - l.blurPos, 200, 0.7f)
-            drawArc(canvas, l, l.hiShader, cx, cy, rx, ry, rot, phi, wMax, l.blurPos, 235, 1f)
+        private fun setCp(i: Int, x: Float, y: Float) {
+            cp[2 * i] = x
+            cp[2 * i + 1] = y
         }
 
-        // Ein Bogen in drei Schichten (Glow, Glow, Kern)
-        private fun drawArc(
-            canvas: Canvas, l: Loop, shader: Shader?,
-            cx: Float, cy: Float, rx: Float, ry: Float, rot: Float,
-            midAngle: Float, wMax: Float, pos: Float, coreAlpha: Int, glowScale: Float
-        ) {
-            if (shader == null) return
-            shader.setLocalMatrix(shaderMatrix)
-            loopPaint.shader = shader
-            for (i in layerGrow.indices) {
-                buildArc(l, cx, cy, rx, ry, rot, midAngle, wMax, layerGrow[i], pos)
-                val a = if (layerGrow[i] == 0f) coreAlpha.toFloat()
-                else 255f * layerAlphaScale[i] * glowStrength * glowScale
-                loopPaint.alpha = min(255f, max(0f, a)).toInt()
-                canvas.drawPath(path, loopPaint)
+        // Kreis aus vier Bézier-Stücken, die 8 Formwerte verbiegen die Griffpunkte
+        private fun buildControl(c: FloatArray) {
+            val a1 = c[SH]
+            val a2 = c[SH + 1]
+            val a3 = c[SH + 2]
+            val a4 = c[SH + 3]
+            val a5 = c[SH + 4]
+            val a6 = c[SH + 5]
+            val a7 = c[SH + 6]
+            val a8 = c[SH + 7]
+            setCp(0, 1f, 0f)
+            setCp(1, 1f - a7, KAPPA - a8)
+            setCp(2, KAPPA + a1, 1f + a2)
+            setCp(3, 0f, 1f)
+            setCp(4, -KAPPA - a1, 1f - a2)
+            setCp(5, a3 - 1f, KAPPA + a4)
+            setCp(6, -1f, 0f)
+            setCp(7, -1f - a3, -KAPPA - a4)
+            setCp(8, a5 - KAPPA, a6 - 1f)
+            setCp(9, 0f, -1f)
+            setCp(10, KAPPA - a5, -1f - a6)
+            setCp(11, 1f + a7, a8 - KAPPA)
+        }
+
+        private fun drawRing(canvas: Canvas, r: Ring, touchS: Float) {
+            val c = r.cur
+            val alphaState = c[A]
+            val scale = c[S]
+            if (alphaState < 0.01f || scale < 0.03f) return
+
+            buildControl(c)
+            val cosRx = cos(c[RX])
+            val sinRx = sin(c[RX])
+            val cosRy = cos(c[RY])
+            val sinRy = sin(c[RY])
+            val aspect = screenH.toFloat() / screenW
+            val camX = 1.5f * camC0
+
+            // Punkte des Rings in den 3D-Raum, dann perspektivisch auf den Bildschirm
+            for (patch in 0 until 4) {
+                val i0 = 3 * patch
+                val i1 = (i0 + 1) % 12
+                val i2 = (i0 + 2) % 12
+                val i3 = (i0 + 3) % 12
+                for (s in 0 until PER) {
+                    val t = s.toFloat() / PER
+                    val u = 1f - t
+                    val b0 = u * u * u
+                    val b1 = 3f * t * u * u
+                    val b2 = 3f * t * t * u
+                    val b3 = t * t * t
+                    val px = b0 * cp[2 * i0] + b1 * cp[2 * i1] + b2 * cp[2 * i2] + b3 * cp[2 * i3]
+                    val py = b0 * cp[2 * i0 + 1] + b1 * cp[2 * i1 + 1] + b2 * cp[2 * i2 + 1] + b3 * cp[2 * i3 + 1]
+
+                    val x1 = px * scale
+                    val y1 = py * scale
+                    val yr = y1 * cosRx
+                    val zr = y1 * sinRx
+                    val xr = x1 * cosRy + zr * sinRy
+                    val zr2 = -x1 * sinRy + zr * cosRy
+
+                    val xv = c[X] + xr - camX
+                    val yv = c[Y] + yr
+                    val dist = max(10.5f, 13f - c[H] + zr2)
+                    val sc = 10f / dist
+                    val ndx = xv * sc
+                    val ndy = yv * sc / aspect
+                    var sx = (ndx * 0.5f + 0.5f) * screenW
+                    var sy = (0.5f - ndy * 0.5f) * screenH
+
+                    if (touchS > 0f) {
+                        val dx = tpX - sx
+                        val dy = tpY - sy
+                        val d = hypot(dx, dy)
+                        if (d > 1f) {
+                            val falloff = d / (0.30f * screenW)
+                            val pull = min(d, touchS * 0.12f * screenW * exp(-falloff * falloff))
+                            sx += dx / d * pull
+                            sy += dy / d * pull
+                        }
+                    }
+
+                    val idx = patch * PER + s
+                    sxA[idx] = sx
+                    syA[idx] = sy
+                    ndxA[idx] = ndx
+                    ndyA[idx] = ndy
+                    zcA[idx] = 1.6667f * dist - 26.667f
+                    sclA[idx] = sc
+                    ptA[idx] = t
+                }
+            }
+
+            val uwEff = r.uWidth * min(r.jScale / max(scale, 0.01f), 1f)
+            val ar = Color.red(r.colorA).toFloat()
+            val ag = Color.green(r.colorA).toFloat()
+            val ab = Color.blue(r.colorA).toFloat()
+            val br0 = Color.red(r.colorB).toFloat()
+            val bg0 = Color.green(r.colorB).toFloat()
+            val bb0 = Color.blue(r.colorB).toFloat()
+
+            for (i in 0 until TOTAL) {
+                val j = (i + 1) % TOTAL
+                // Tiefenschärfe: außerhalb der Schärfeebene wird das Band blasser
+                val zc = (zcA[i] + zcA[j]) * 0.5f
+                val d1 = max((zc + 4f) * (zc + 4f) * 0.5f, 1f)
+                val d2 = max((zc + 5f) * (zc + 5f) * 0.5f, 1f)
+                val alpha = min(1f, uwEff * 20f / d1) / d2 * 0.98f * alphaState
+                if (alpha < 0.012f) continue
+
+                // Beleuchtung: oben links hell, unten rechts dunkel
+                val nx = (ndxA[i] + ndxA[j]) * 0.5f
+                val ny = (ndyA[i] + ndyA[j]) * 0.5f
+                val lit = smooth(-0.35f, 0.55f, 0.65f * ny - 0.35f * nx)
+
+                val ph = abs(ptA[i] - 0.5f) * 2f
+                val baseR = ar * (1f - ph) + br0 * ph
+                val baseG = ag * (1f - ph) + bg0 * ph
+                val baseB = ab * (1f - ph) + bb0 * ph
+                val bright = 0.62f + 0.5f * lit
+                val spec = smooth(0.65f, 1f, lit) * 0.45f
+                val cr = min(255f, baseR * bright + 255f * spec).toInt()
+                val cg = min(255f, baseG * bright + 255f * spec).toInt()
+                val cb = min(255f, baseB * bright + 255f * spec).toInt()
+
+                val wpx = max(
+                    1f,
+                    uwEff * 0.1f * scale * (sclA[i] + sclA[j]) * 0.5f * screenW * 0.5f * lineWidthScale
+                )
+
+                // Schein an hellen Stellen
+                if (glowStrength > 0f && lit > 0.6f) {
+                    // Schein wird stärker, je weiter der Startbildschirm von der Mitte entfernt ist
+                    val g = 0.035f * smooth(0.6f, 0.9f, lit) * alpha * glowStrength * (1f + 1.5f * abs(camC0))
+                    linePaint.strokeCap = Paint.Cap.ROUND
+                    drawSeg(canvas, i, cr, cg, cb, g, max(2f, wpx * 10f))
+                    linePaint.strokeCap = Paint.Cap.BUTT
+                }
+                // Band mit weichem Rand: breit und blass, schmal und deckend
+                drawSeg(canvas, i, cr, cg, cb, alpha * 0.35f, wpx)
+                drawSeg(canvas, i, cr, cg, cb, alpha * 0.7f, max(1f, wpx * 0.55f))
+                drawSeg(canvas, i, cr, cg, cb, alpha, max(1f, wpx * 0.25f))
             }
         }
 
-        // Halbkreisbogen um die Richtung midAngle; Dicke läuft an beiden Enden auf null aus.
-        // grow = 0: Kern, grow > 0: Glow (breiter, an unscharfen Stellen noch breiter)
-        private fun buildArc(
-            l: Loop, cx: Float, cy: Float, rx: Float, ry: Float, rot: Float,
-            midAngle: Float, wMax: Float, grow: Float, pos: Float
+        private fun drawSeg(
+            canvas: Canvas, i: Int, cr: Int, cg: Int, cb: Int, alpha: Float, width: Float
         ) {
-            val cr = cos(rot)
-            val sr = sin(rot)
-            for (j in 0..steps) {
-                val s = j.toFloat() / steps
-                val th = midAngle - piF / 2f + piF * s
-                val ct = cos(th)
-                val st = sin(th)
-                val px = rx * ct
-                val py = ry * st
-                var nx = ry * ct
-                var ny = rx * st
-                val len = hypot(nx, ny)
-                nx /= len
-                ny /= len
-
-                val b = blurAt(l, s, pos)
-                val widen = if (grow == 0f) 1f + 0.6f * b else 1f + grow * (0.7f + 2.2f * b)
-                // Rundungsfehler an den Enden dürfen nicht negativ werden (sonst NaN)
-                val sn = max(0f, sin(piF * s))
-                val wd = wMax * sn * sqrt(sn) * widen
-
-                val ox = px + nx * wd * 0.5f
-                val oy = py + ny * wd * 0.5f
-                val ix = px - nx * wd * 0.5f
-                val iy = py - ny * wd * 0.5f
-
-                outX[j] = cx + ox * cr - oy * sr
-                outY[j] = cy + ox * sr + oy * cr
-                inX[j] = cx + ix * cr - iy * sr
-                inY[j] = cy + ix * sr + iy * cr
-            }
-
-            path.rewind()
-            path.moveTo(outX[0], outY[0])
-            for (j in 1..steps) path.lineTo(outX[j], outY[j])
-            for (j in steps downTo 0) path.lineTo(inX[j], inY[j])
-            path.close()
+            val a = (min(1f, alpha) * 255f).toInt()
+            if (a <= 0) return
+            val j = (i + 1) % TOTAL
+            linePaint.color = Color.argb(a, cr, cg, cb)
+            linePaint.strokeWidth = width
+            canvas.drawLine(sxA[i], syA[i], sxA[j], syA[j], linePaint)
         }
     }
 }
