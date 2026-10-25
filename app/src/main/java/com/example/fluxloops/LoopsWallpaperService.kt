@@ -1,5 +1,6 @@
 package com.example.fluxloops
 
+
 import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -651,15 +652,15 @@ class LoopsWallpaperService : WallpaperService() {
                     var sy = (0.5f - ndy * 0.5f) * screenH
 
                     if (touchS > 0f) {
+                        // Sanfte, großräumige Verschiebung zum Finger: alle Ringe wandern ein Stück
+                        // mit und verbiegen sich nur leicht, ohne lokale Beulen am Finger
                         val dx = tpX - sx
                         val dy = tpY - sy
-                        val d = hypot(dx, dy)
-                        if (d > 1f) {
-                            val falloff = d / (0.30f * screenW)
-                            val pull = min(d, touchS * 0.12f * screenW * exp(-falloff * falloff))
-                            sx += dx / d * pull
-                            sy += dy / d * pull
-                        }
+                        val soft = hypot(dx, dy) + 0.5f * screenW
+                        val wide = hypot(dx, dy) / (1.6f * screenW)
+                        val pull = touchS * 0.2f * screenW * exp(-wide * wide)
+                        sx += dx / soft * pull
+                        sy += dy / soft * pull
                     }
 
                     val idx = patch * PER + s
@@ -693,14 +694,15 @@ class LoopsWallpaperService : WallpaperService() {
                 // Beleuchtung: oben links hell, unten rechts dunkel
                 val nx = (ndxA[i] + ndxA[j]) * 0.5f
                 val ny = (ndyA[i] + ndyA[j]) * 0.5f
-                val lit = smooth(-0.35f, 0.55f, 0.65f * ny - 0.35f * nx)
+                val lit = smooth(-0.35f, 0.55f, -0.65f * ny - 0.35f * nx)
 
                 val ph = abs(ptA[i] - 0.5f) * 2f
                 val baseR = ar * (1f - ph) + br0 * ph
                 val baseG = ag * (1f - ph) + bg0 * ph
                 val baseB = ab * (1f - ph) + bb0 * ph
-                val bright = 0.62f + 0.5f * lit
-                val spec = smooth(0.65f, 1f, lit) * 0.45f
+                // Glanz: weniger weiß, besonders bei Ringen weiter hinten
+                val bright = 0.62f + 0.38f * lit
+                val spec = smooth(0.65f, 1f, lit) * 0.18f * max(0.3f, 1f - 0.5f * c[H])
                 val cr = min(255f, baseR * bright + 255f * spec).toInt()
                 val cg = min(255f, baseG * bright + 255f * spec).toInt()
                 val cb = min(255f, baseB * bright + 255f * spec).toInt()
@@ -715,7 +717,9 @@ class LoopsWallpaperService : WallpaperService() {
                     // Schein wird stärker, je weiter der Startbildschirm von der Mitte entfernt ist
                     val g = 0.035f * smooth(0.6f, 0.9f, lit) * alpha * glowStrength * (1f + 1.5f * abs(camC0))
                     linePaint.strokeCap = Paint.Cap.ROUND
-                    drawSeg(canvas, i, cr, cg, cb, g, max(2f, wpx * 10f))
+                    drawSeg(canvas, i, cr, cg, cb, g, max(2f, wpx * 2f))
+                    drawSeg(canvas, i, cr, cg, cb,  0.5f * g * (1 - g), max(2f, wpx * 3f))
+                    drawSeg(canvas, i, cr, cg, cb,  0.9f * g * (1 - g), max(2f, wpx * 4f))
                     linePaint.strokeCap = Paint.Cap.BUTT
                 }
                 // Band mit weichem Rand: breit und blass, schmal und deckend
